@@ -1,0 +1,336 @@
+---
+title: "資源量推定"
+author: "kei kawamura"
+date: "2/27/2020"
+output: html_document
+---
+===================  
+本来の目的：余剰生産モデルによる資源量推定を用いて、パラメーター推定を行う。->エクセルのソルバーでの操作をR上で行う方法が知識不足で頓挫
+現在の状態での目的：余剰生産モデルを用いて、資源量推定を行う。  
+保有しているデータ：操業日・漁獲量・魚種・水揚げ高(高値・平均値・安値)・漁業種・規格・エクセルのソルバーで推定したパラメーター(r,K,B0,q)  
+===================
+
+# データ設計
+
+```{R}
+library(tidyverse)
+library(ggplot2)
+
+#岩手大漁ナビのデータ(rds形式)を読み込む。
+setwd("~/Downloads")
+#IwateData_Cleaned_Kei_24Feb20 <- readRDS("~/Downloads/IwateData_Cleaned_Kei_24Feb20.rds")
+fish <- read.csv("suikenn_kei.csv")
+fish <- fish %>%
+  mutate(Year_catch = as.numeric(Year_catch),
+         Annual_landing_day = as.numeric(Annual_landing_day))
+#memo
+#シリアル化(Serialization)は、オブジェクトの状態を永続化または転送可能な形式に変換するプロセスのこと。必要な時に再構築できるように、オブジェクトの状態を保存することが目的である。(参照：https://figshare.com/articles/R_____Rda_Rds_Feather/3496490/1)
+#rdaは複数のオブジェクトの保存に適しており、save()・load()を使用する。
+#rdsは単一のオブジェクトの保存に適しており、saveRDS()・readRDSを使用する。
+
+#イシガレイのデータのみを取り出す
+#landing <- IwateData_Cleaned_Kei_24Feb20 %>%
+#  filter(Fish_Species=="stone_flounder")
+
+#努力量一定(操業船数一定)という仮定の基に操業日を努力量として抽出
+#landing_day <- data.frame(table(landing$Year)) %>%
+#  select(Year = Var1, Annual_landing_day = Freq) %>%
+#  mutate(Year = as.character(Year))
+
+#データを合併し、年総漁獲量をYear_catchという列に格納
+#fish <- landing %>%
+#  left_join(landing_day,by="Year") %>%
+#  group_by(Year,Annual_landing_day) %>%
+#  summarise(Year_catch = sum(Landings_kg)) %>%
+#  ungroup()
+
+#write_csv(landing1,"landing.csv")
+
+```
+
+# パラメーター推定 (Excelソルバーで算出したものを利用、単位を戻すようにパラメーターを調整)
+
+```{r}
+fish1 <- fish %>%
+  mutate(
+    Year = as.numeric(Year), #デフォルトではcharacterになっており、そのままでは作図時できないので変換。(年の大小を認識できない)
+    Annual_landing_day_10000 = Annual_landing_day/10000,
+    Year_catch_10000 = Year_catch/10000,
+    CPUEt = Year_catch_10000/Annual_landing_day_10000,
+    Biomass = 0
+  )
+
+#エクセルのソルバー によって推定されたパラメーター値
+r <- 0.07035537 #Intrinsic growth rate(内的自然増加率)
+K <- 472.357673 #Carrying capacity(環境収容力)
+B0 <- 644.988029
+fish1$Biomass[1] <- 644.988029*10000 #データ開始年資源量
+q <- 0.01819197 #Catchability coefficient(漁具能率)
+K_10000 <- K*10000
+q_10000 <- q/10000
+
+#Surplus Production Modelの関数を自作(※r,K,B0,qは既にあるものとする)
+spm <- function(data,Xt){
+  for(i in 1:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+r*data$Biomass[i]*(1-(data$Biomass[i]/K_10000))-q_10000*Xt[i]*data$Biomass[i] 
+  }
+  return(data)
+}
+    
+fish2 <- spm(data = fish1,Xt=fish1$Annual_landing_day)   
+
+```
+
+# 作図 Excelのソルバーで推定したパラメーターでの作図
+
+```{r}
+
+fish3 <- fish2 %>%
+  mutate(
+    r = r,
+    K = K_10000,
+    q = q_10000,
+    q_Bt = q_10000*Biomass,
+    est_Year_catch_qXtBt = q_10000*Annual_landing_day
+  )
+
+#作図：黒線は資源量、赤線は環境収容力を示す。
+ggplot(fish3,aes(x=Year,y=Biomass))+
+  geom_line()+
+  labs(title="Estimated Biomass of stone flounder")+
+  geom_hline(yintercept = K_10000,colour = "red")
+
+#CPUE
+ggplot(fish3,aes(x=Year,y=CPUEt))+
+  geom_line(col="blue")+
+  geom_line(aes(x=fish3$Year,y=fish3$q_Bt),col="red")+
+  labs(title = "CPUE(Blue-Observed Red-Estimated)")
+
+#Year_catch
+ggplot(fish3,aes(x=Year,y=Year_catch))+
+  geom_line()+
+  labs(title="Estimated Annual Catch of stone flounder (Red = Estimated)")+
+  geom_line(aes(x = Year,y=est_Year_catch_qXtBt),colour = "red")
+
+```
+
+#パラメーター推定 最小にするのはCPUEの差
+
+```{r}
+#optim関数に入れる関数を作成
+spm_est_param <- function(data,par){
+  data$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*data$Annual_landing_day_10000[1]*par[1]
+  data$Biomass[1] <- par[1]
+  for (i in 2:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[3]))-par[4]*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  sum((par[4]*data$Biomass-data$CPUEt)^2)
+}
+
+#parの順番はB0,r,K,q。optim関数は既定では目的関数の最小化を行う。最大化を行うには別途control=list(fnscale=-1)を指定する。
+estimated_param <- optim(
+  #c(1,1,1,1),
+  c(B0,r,K,q),
+  spm_est_param,
+  data = fish2,
+  method = "L-BFGS-B" #準ニュートン法の一種
+)
+
+#結果を閲覧
+str(estimated_param)
+#パラメーターのみを格納
+parameter_CPUE <- estimated_param$par
+#操業日数を1/10000にしたので、元の単位に戻すにはq,K,Bはそれぞれ1/10000,10000倍,10000倍にする必要がある。B0,r,K,q,B0*10000,K*10000,q/10000
+parameter_CPUE <- c(parameter_CPUE,parameter_CPUE[1]*10000,parameter_CPUE[3]*10000,parameter_CPUE[4]/10000)
+
+```
+
+#資源量推定(optimで推定したパラメーターをスケールを戻して使用) 最小にするのはCPUEの差
+
+```{r}
+options(digits = 3)
+#推定したパラメーターを用いて、SPMを実行する関数を作成(パラメーターは10000を掛ける・割るしたもの)
+spm_cal_param_CPUE <- function(data,par){
+  data$Biomass[1] <- par[5]
+  for (i in 1:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[6]))-par[7]*data$Annual_landing_day[i]*data$Biomass[i] 
+  }
+  data$SSR_CPUE_qBt <- (par[7]*data$Biomass-data$CPUEt)^2
+  data$est_Year_catch_qXtBt <- data$Annual_landing_day*par[7]*data$Biomass
+  return(data)
+}
+
+#パラメーターを伴って、資源量推定を行う。加えて、delta_B列に資源量の増加量を格納
+fish4 <- spm_cal_param_CPUE(fish2,parameter_CPUE) %>%
+  mutate(
+    delta_B = Biomass-lag(Biomass),
+    catch_diff = Year_catch-est_Year_catch_qXtBt #推定漁獲量と予測漁獲量の差を計算
+         )
+#Biomass
+ggplot(fish4,aes(x=Year,y=Biomass))+
+  geom_line()+
+  labs(title="Estimated Biomass of stone flounder (Red=K)")+
+  geom_hline(yintercept = parameter_CPUE[6],colour = "red")
+
+#CPUE
+ggplot(fish3,aes(x=Year,y=CPUEt))+
+  geom_line(col="blue")+
+  geom_line(aes(x=fish3$Year,y=fish3$q_Bt),col="red")+
+  labs(title = "CPUE(Blue-Observed Red-Estimated)")
+
+#Year_catch
+ggplot(fish4,aes(x=Year,y=Year_catch))+
+  geom_line()+
+  labs(title="Estimated Annual Catch of stone flounder (Red = Estimated)")+
+  geom_line(aes(x = Year,y=est_Year_catch_qXtBt),colour = "red")
+
+
+```
+
+#パラメーター推定 今度は年間漁獲量の差を最小にしよう
+
+```{r}
+#optim関数に入れる関数を作成
+spm_est_param_H <- function(data,par){
+  data$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*data$Annual_landing_day_10000[1]*par[1]
+  data$Biomass[1] <- par[1]
+  for (i in 2:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[3]))-par[4]*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  sum((par[4]*data$Biomass*data$Annual_landing_day_10000-data$Year_catch_10000)^2)
+}
+
+#parの順番はB0,r,K,q。optim関数は既定では目的関数の最小化を行う。最大化を行うには別途control=list(fnscale=-1)を指定する。
+estimated_param_H <- optim(
+  #c(1,1,1,1),
+  c(fish2$Biomass[1],r,K,q),
+  spm_est_param_H,
+  data = fish2,
+  method = "L-BFGS-B" #準ニュートン法の一種
+)
+
+#結果を閲覧
+str(estimated_param_H)
+#パラメーターのみを格納
+parameter_H <- estimated_param_H$par
+#操業日数を1/10000にしたので、元の単位に戻すにはq,K,Bはそれぞれ1/10000,10000倍,10000倍にする必要がある。B0,r,K,q,B0*10000,K*10000,q/10000
+parameter_H <- c(parameter_H,parameter_H[1]*10000,parameter_H[3]*10000,parameter_H[4]/10000)
+
+#パラメーターをデータフレームにまとめる
+parameter_df <- data.frame(rbind(parameter_CPUE,parameter_H))
+names(parameter_df) <- c("B0","r","K","q","B0_10000times","K_10000times","q_10000") #q_10000はq/10000の意味
+
+```
+
+#資源量推定(optimで推定したパラメーターを使用) 最小にするのはCPUEの差
+
+```{r}
+options(digits = 3)
+#推定したパラメーターを用いて、SPMを実行する関数を作成(パラメーターは10000を掛ける・割るしたもの)
+spm_cal_param_H <- function(data,par){
+  data$Biomass[1] <- par[5]
+  for (i in 1:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[6]))-par[7]*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  data$SSR_CPUE_qBt <- (par[7]*data$Biomass-data$CPUEt)^2
+  data$est_Year_catch_qXtBt <- data$Annual_landing_day*par[7]*data$Biomass
+  return(data)
+}
+
+#パラメーターを伴って、資源量推定を行う。加えて、delta_B列に資源量の増加量を格納
+fish5 <- spm_cal_param_H(fish2,parameter_H) %>%
+  mutate(
+    delta_B = Biomass-lag(Biomass),
+    catch_diff = Year_catch-est_Year_catch_qXtBt #推定漁獲量と予測漁獲量の差を計算
+         )
+
+ggplot(fish5,aes(x=Year,y=Biomass))+
+  geom_line()+
+  labs(title="Estimated Biomass of stone flounder (calculated by R)")+
+  geom_hline(yintercept = parameter_H[6],colour = "red")
+
+ggplot(fish5,aes(x=Year,y=Year_catch))+
+  geom_line()+
+  labs(title="Estimated Annual Catch of stone flounder (Red = Estimated)")+
+  geom_line(aes(x = Year,y=est_Year_catch_qXtBt),colour = "red")
+
+
+```
+
+# パラメーラー推定(作るまでの道のり色々)
+
+```{r}
+#手元にあるのは、Annual_landing_day(年間合計操業日),Year_catch(漁獲量),CPUEt(先述の二つを1/10000にスケールダウンして算出)
+
+#excelのソルバーと対応させながら考えよう
+#目的セル = sum(q*Bt-CPUEt)^2 = 予測CPUEt-観測CPUEの二乗和
+#変数セル = B,r,K,q
+#spm_param <- function(data,B,r,K,q){
+#  i <- nrow(data)
+#  B[i+1] <- B[i]+r*B[i]*(1-(B[i]/K))-q*data$Annual_landing_day[i]*B[i] 
+#  sum((q*B[i]-data$CPUEt[i])^2)
+#}
+
+#spm_param_se <- function(data){
+#  B0+r*B0*(1-(B0/K))-q*data$Annual_landing_day_10000*B0
+#  data$Biomass <- B0
+#  for (i in 1:(nrow(data)-1)){
+#    data$Biomass[i+1] <- data$Biomass[i]+r*data$Biomass[i]*(1-(data$Biomass[i]/K))-q*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+#  }
+#  SSQ <- sum((q*data$Biomass-data$CPUEt)^2)
+#}
+#
+#fish2 <- fish2 %>%
+#  mutate(Biomass = 0)
+#
+#spm_param_se1 <- function(par){
+#  par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*fish2$Annual_landing_day_10000*par[1]
+#  fish2$Biomass <- par[1]
+#  for (i in 1:(nrow(fish2)-1)){
+#    fish2$Biomass[i+1] <- fish2$Biomass[i]+par[1]*fish2$Biomass[i]*(1-(fish2$Biomass[i]/par[3]))-par[4]*fish2$An#nual_landing_day_10000[i]*fish2$Biomass[i] 
+#  }
+#  sum((par[4]*fish2$Biomass-fish2$CPUEt)^2)
+#}
+#
+#parの順番はB0,r,K,q,SSQ
+#estimated_param <- optim(
+#  #c(400,1.7,650,0.003),
+#  c(fish2$Biomass[1],r,K,q),
+#  spm_param_se1,
+#  method = "L-BFGS-B"
+#  #lower = c(1,0.1,1,0,1),
+#  #upper = c(1000,10,10000,1,10000)
+#)
+##optim関数に入れる関数を作成
+#spm_est_param_aa <- function(data,par){
+#  data$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*data$Annual_landing_day_10000[1]*par[1]
+#  data$Biomass[1] <- par[1]
+#  for (i in 2:(nrow(data)-1)){
+#    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[3]))-par[4]*data$Annual_landing_day_10000[i]*data#$Biomass[i] 
+#  }
+#  sum((par[4]*data$Biomass-data$CPUEt)^2)
+#}
+
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~ memo ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#par <- c(400,1.7,650,0.003)
+#spm_param_se1(par)
+
+#spm_param_se1 <- function(par){
+#  fish2$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*fish2$Annual_landing_day_10000[1]*par[1]
+#  fish2$Biomass[1] <- par[1]
+#  for (i in 2:(nrow(fish2)-1)){
+#    fish2$Biomass[i+1] <- fish2$Biomass[i]+par[2]*fish2$Biomass[i]*(1-(fish2$Biomass[i]/par[3]))-par[4]*fish2$An#nual_landing_day_10000[i]*fish2$Biomass[i] 
+#  }
+#  sum((par[4]*fish2$Biomass-fish2$CPUEt)^2)
+#}
+#
+#
+#a <- fish3 %>%
+#  mutate(ssq = (fish3$q_Bt-fish3$CPUEt)^2)
+
+#sum((fish3$q_Bt-fish3$CPUEt)^2)
+```
+

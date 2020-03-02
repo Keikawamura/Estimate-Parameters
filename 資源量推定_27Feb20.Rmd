@@ -1,0 +1,216 @@
+---
+title: "資源量推定"
+author: "kei kawamura"
+date: "2/27/2020"
+output: html_document
+---
+===================
+本来の目的：余剰生産モデルによる資源量推定を用いて、パラメーター推定を行う。->エクセルのソルバーでの操作をR上で行う方法が知識不足で頓挫
+現在の状態での目的：余剰生産モデルを用いて、資源量推定を行う。
+保有しているデータ：操業日・漁獲量・魚種・水揚げ高(高値・平均値・安値)・漁業種・規格・エクセルのソルバーで推定したパラメーター(r,K,B0,q)
+
+
+===================
+
+# データ設計
+
+```{R}
+library(tidyverse)
+
+#岩手大漁ナビのデータ(rds形式)を読み込む。
+setwd("~/Downloads")
+IwateData_Cleaned_Kei_24Feb20 <- readRDS("~/Downloads/IwateData_Cleaned_Kei_24Feb20.rds")
+#memo
+#シリアル化(Serialization)は、オブジェクトの状態を永続化または転送可能な形式に変換するプロセスのこと。必要な時に再構築できるように、オブジェクトの状態を保存することが目的である。(参照：https://figshare.com/articles/R_____Rda_Rds_Feather/3496490/1)
+#rdaは複数のオブジェクトの保存に適しており、save()・load()を使用する。
+#rdsは単一のオブジェクトの保存に適しており、saveRDS()・readRDSを使用する。
+
+#イシガレイのデータのみを取り出す
+landing <- IwateData_Cleaned_Kei_24Feb20 %>%
+  filter(Fish_Species=="stone_flounder")
+
+#努力量一定(操業船数一定)という仮定の基に操業日を努力量として抽出
+landing_day <- data.frame(table(landing$Year)) %>%
+  select(Year = Var1, Annual_landing_day = Freq) %>%
+  mutate(Year = as.character(Year))
+
+#データを合併し、年総漁獲量をYear_catchという列に格納
+ishigarei <- landing %>%
+  left_join(landing_day,by="Year") %>%
+  group_by(Year,Annual_landing_day) %>%
+  summarise(Year_catch = sum(Landings_kg)) %>%
+  ungroup()
+
+#write_csv(landing1,"landing.csv")
+
+```
+
+# パラメータ推定
+
+```{r}
+ishigarei1 <- ishigarei %>%
+  mutate(
+    Year = as.numeric(Year), #デフォルトではcharacterになっており、そのままでは作図時できないので変換。(年の大小を認識できない)
+    Annual_landing_day_10000 = Annual_landing_day/10000,
+    Year_catch_10000 = Year_catch/10000,
+    CPUEt = Year_catch_10000/Annual_landing_day_10000,
+    Biomass = 0
+  )
+
+#エクセルのソルバー によって推定されたパラメーター値
+r <- 1.81988661 #Intrinsic growth rate(内的自然増加率)
+K <- 658.074097 #Carrying capacity(環境収容力)
+ishigarei1$Biomass[1] <- 446.581191 #データ開始年資源量
+q <- 0.00368155 #Catchability coefficient(漁具能率)
+
+#Surplus Production Modelの関数を自作(※r,K,B0,qは既にあるものとする)
+spm <- function(data,Xt){
+  for(i in 1:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+r*data$Biomass[i]*(1-(data$Biomass[i]/K))-q*Xt[i]*data$Biomass[i] 
+  }
+  return(data)
+}
+    
+ishigarei2 <- spm(data = ishigarei1,Xt=ishigarei1$Annual_landing_day_10000)   
+
+```
+
+# 作図
+
+```{r}
+
+ishigarei3 <- ishigarei2 %>%
+  mutate(
+    r = r,
+    K = K,
+    q = q,
+    q_Bt = q*Biomass
+  )
+
+#作図：黒線は資源量、赤線は環境収容力を示す。
+ggplot(ishigarei3,aes(x=Year,y=Biomass))+
+  geom_line()+
+  labs(title="Estimated Biomass of stone flounder")+
+  geom_hline(yintercept = K,colour = "red")
+
+```
+
+#パラメーター推定
+
+```{r}
+#optim関数に入れる関数を作成
+spm_est_param <- function(data,par){
+  data$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*data$Annual_landing_day_10000[1]*par[1]
+  data$Biomass[1] <- par[1]
+  for (i in 2:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[3]))-par[4]*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  sum((par[4]*data$Biomass-data$CPUEt)^2)
+}
+
+#parの順番はB0,r,K,q。optim関数は既定では目的関数の最小化を行う。最大化を行うには別途control=list(fnscale=-1)を指定する。
+estimated_param <- optim(
+  #c(1,1,1,1),
+  c(ishigarei2$Biomass[1],r,K,q),
+  spm_est_param,
+  data = ishigarei2,
+  method = "L-BFGS-B" #準ニュートン法の一種
+)
+
+#結果を閲覧
+str(estimated_param)
+
+```
+
+
+# パラメーラー推定(作るまでの道のり色々)
+
+```{r}
+#手元にあるのは、Annual_landing_day(年間合計操業日),Year_catch(漁獲量),CPUEt(先述の二つを1/10000にスケールダウンして算出)
+
+#excelのソルバーと対応させながら考えよう
+#目的セル = sum(q*Bt-CPUEt)^2 = 予測CPUEt-観測CPUEの二乗和
+#変数セル = B,r,K,q
+spm_param <- function(data,B,r,K,q){
+  i <- nrow(data)
+  B[i+1] <- B[i]+r*B[i]*(1-(B[i]/K))-q*data$Annual_landing_day[i]*B[i] 
+  sum((q*B[i]-data$CPUEt[i])^2)
+}
+
+spm_param_se <- function(data){
+  B0+r*B0*(1-(B0/K))-q*data$Annual_landing_day_10000*B0
+  data$Biomass <- B0
+  for (i in 1:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+r*data$Biomass[i]*(1-(data$Biomass[i]/K))-q*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  SSQ <- sum((q*data$Biomass-data$CPUEt)^2)
+}
+
+ishigarei2 <- ishigarei2 %>%
+  mutate(Biomass = 0)
+
+spm_param_se1 <- function(par){
+  par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*ishigarei2$Annual_landing_day_10000*par[1]
+  ishigarei2$Biomass <- par[1]
+  for (i in 1:(nrow(ishigarei2)-1)){
+    ishigarei2$Biomass[i+1] <- ishigarei2$Biomass[i]+par[1]*ishigarei2$Biomass[i]*(1-(ishigarei2$Biomass[i]/par[3]))-par[4]*ishigarei2$Annual_landing_day_10000[i]*ishigarei2$Biomass[i] 
+  }
+  sum((par[4]*ishigarei2$Biomass-ishigarei2$CPUEt)^2)
+}
+
+#parの順番はB0,r,K,q,SSQ
+estimated_param <- optim(
+  #c(400,1.7,650,0.003),
+  c(ishigarei2$Biomass[1],r,K,q),
+  spm_param_se1,
+  method = "L-BFGS-B"
+  #lower = c(1,0.1,1,0,1),
+  #upper = c(1000,10,10000,1,10000)
+)
+#optim関数に入れる関数を作成
+spm_est_param_aa <- function(data,par){
+  data$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*data$Annual_landing_day_10000[1]*par[1]
+  data$Biomass[1] <- par[1]
+  for (i in 2:(nrow(data)-1)){
+    data$Biomass[i+1] <- data$Biomass[i]+par[2]*data$Biomass[i]*(1-(data$Biomass[i]/par[3]))-par[4]*data$Annual_landing_day_10000[i]*data$Biomass[i] 
+  }
+  sum((par[4]*data$Biomass-data$CPUEt)^2)
+}
+
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~ memo ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+par <- c(400,1.7,650,0.003)
+spm_param_se1(par)
+
+spm_param_se1 <- function(par){
+  ishigarei2$Biomass[2] <- par[1]+par[2]*par[1]*(1-(par[1]/par[3]))-par[4]*ishigarei2$Annual_landing_day_10000[1]*par[1]
+  ishigarei2$Biomass[1] <- par[1]
+  for (i in 2:(nrow(ishigarei2)-1)){
+    ishigarei2$Biomass[i+1] <- ishigarei2$Biomass[i]+par[2]*ishigarei2$Biomass[i]*(1-(ishigarei2$Biomass[i]/par[3]))-par[4]*ishigarei2$Annual_landing_day_10000[i]*ishigarei2$Biomass[i] 
+  }
+  sum((par[4]*ishigarei2$Biomass-ishigarei2$CPUEt)^2)
+}
+
+
+a <- ishigarei3 %>%
+  mutate(ssq = (ishigarei3$q_Bt-ishigarei3$CPUEt)^2)
+
+sum((ishigarei3$q_Bt-ishigarei3$CPUEt)^2)
+
+f <- function(x) {
+  x ^ 2 + 3 * x + 1
+}
+optim(par = -2, fn = f, method = "L-BFGS-B", lower = -3, upper = 3)
+
+x <- seq(0,100,5)
+y <- c(98, 97, 96, 94, 92, 84, 78, 73, 61, 53, 43, 37, 30, 28, 24, 22, 21, 20, 20, 20, 18)
+resid <- function(par)	# 関数名は何でも良い。引数は，パラメータのベクトル。x, y は，大域変数として参照する。
+{
+	yhat <- par[1]/(1+par[2]*exp(-par[3]*x))+par[4]	# y ~ a/(1+b*exp(-c*x))+d のこと
+	sum((y-yhat)^2)	# 残差平方和を返す
+}
+optim(c(-100, 50, 1, 100), resid)
+```
+
