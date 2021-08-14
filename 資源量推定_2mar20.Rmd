@@ -324,6 +324,17 @@ ggplot(fish_all,aes(x=Year,y=Biomass,color=種類))+
   geom_hline(yintercept = parameters_all$K_10000times[4],col="#c71585")+
   labs(title="Estimated Biomass (horizontal line = Estimated K:Carrying Capacity)")
 
+ggplot(fish_all,aes(x=Year,y=Biomass,color=種類))+
+  theme(text = element_text(family = "HiraKakuPro-W3"))+
+  geom_line(position = "jitter")+
+  scale_color_manual(values = c(catch="#dc143c", est_catch="#c71585",cpue="#0000cd",excel="#006400"))+
+  layer(geom = line,)
+  geom_hline(yintercept = parameters_all$K_10000times[1],col="#006400")+
+  geom_hline(yintercept = parameters_all$K_10000times[2],col="#0000cd")+
+  geom_hline(yintercept = parameters_all$K_10000times[3],col="#dc143c")+
+  geom_hline(yintercept = parameters_all$K_10000times[4],col="#c71585")+
+  labs(title="Estimated Biomass (horizontal line = Estimated K:Carrying Capacity)")
+
 #CPUE
 ggplot(fish_all,aes(x=Year,y=推定CPUE_qBt,color=種類))+
   theme(text = element_text(family = "HiraKakuPro-W3"))+
